@@ -1,7 +1,7 @@
 displayName: Cacheify
 summary: Cacheify your traefik routes. Adds a filesystem cache.
 type: middleware
-import: github.com/ciaranj/cacheify
+import: github.com/huihuimoe/cacheify
 iconPath: icon.png
 testData:
   path: /tmp
