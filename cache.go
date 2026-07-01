@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -111,28 +112,30 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	key := cacheKey(r, m.cfg.QueryInKey)
 
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		if r.Header.Get("If-Range") != "" {
+			m.next.ServeHTTP(w, r)
+			return
+		}
+
+		cached, err := m.cache.GetStream(key)
+		if err == nil {
+			defer cached.Body.Close()
+
+			if m.serveCachedRange(w, cached, rangeHeader) {
+				return
+			}
+		}
+
+		m.next.ServeHTTP(w, r)
+		return
+	}
+
 	// First check: Try to serve from cache (non-blocking read)
 	cached, err := m.cache.GetStream(key)
 	if err == nil {
 		defer cached.Body.Close()
-
-		// Write headers
-		for key, vals := range cached.Metadata.Headers {
-			for _, val := range vals {
-				w.Header().Add(key, val)
-			}
-		}
-		if m.cfg.AddStatusHeader {
-			w.Header().Set(cacheHeader, cacheHitStatus)
-		}
-
-		// Write status
-		w.WriteHeader(cached.Metadata.Status)
-
-		// Stream body using pooled buffer to reduce allocations
-		buf := copyBufferPool.Get().(*[]byte)
-		_, _ = io.CopyBuffer(w, cached.Body, *buf)
-		copyBufferPool.Put(buf)
+		m.serveCachedResponse(w, cached)
 		return
 	}
 
@@ -149,24 +152,7 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			cached, err := m.cache.GetStream(key)
 			if err == nil {
 				defer cached.Body.Close()
-
-				// Write headers
-				for key, vals := range cached.Metadata.Headers {
-					for _, val := range vals {
-						w.Header().Add(key, val)
-					}
-				}
-				if m.cfg.AddStatusHeader {
-					w.Header().Set(cacheHeader, cacheHitStatus)
-				}
-
-				// Write status
-				w.WriteHeader(cached.Metadata.Status)
-
-				// Stream body using pooled buffer to reduce allocations
-				buf := copyBufferPool.Get().(*[]byte)
-				_, _ = io.CopyBuffer(w, cached.Body, *buf)
-				copyBufferPool.Put(buf)
+				m.serveCachedResponse(w, cached)
 				return
 			}
 		} else {
@@ -217,7 +203,130 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.next.ServeHTTP(rw, r)
 }
 
+func (m *cache) serveCachedResponse(w http.ResponseWriter, cached *cachedResponse) {
+	for key, vals := range cached.Metadata.Headers {
+		for _, val := range vals {
+			w.Header().Add(key, val)
+		}
+	}
+	if m.cfg.AddStatusHeader {
+		w.Header().Set(cacheHeader, cacheHitStatus)
+	}
+
+	w.WriteHeader(cached.Metadata.Status)
+
+	buf := copyBufferPool.Get().(*[]byte)
+	_, _ = io.CopyBuffer(w, cached.Body, *buf)
+	copyBufferPool.Put(buf)
+}
+
+func (m *cache) serveCachedRange(w http.ResponseWriter, cached *cachedResponse, rangeHeader string) bool {
+	if cached.Metadata.Status != http.StatusOK {
+		return false
+	}
+
+	byteRange, supported, satisfiable := parseSingleByteRange(rangeHeader, cached.BodySize)
+	if !supported {
+		return false
+	}
+
+	for key, vals := range cached.Metadata.Headers {
+		for _, val := range vals {
+			w.Header().Add(key, val)
+		}
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	if m.cfg.AddStatusHeader {
+		w.Header().Set(cacheHeader, cacheHitStatus)
+	}
+
+	if !satisfiable {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", cached.BodySize))
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return true
+	}
+
+	length := byteRange.end - byteRange.start + 1
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", byteRange.start, byteRange.end, cached.BodySize))
+	w.WriteHeader(http.StatusPartialContent)
+
+	section := io.NewSectionReader(cached.Body.file, cached.Body.bodyOffset+byteRange.start, length)
+	buf := copyBufferPool.Get().(*[]byte)
+	_, _ = io.CopyBuffer(w, section, *buf)
+	copyBufferPool.Put(buf)
+	return true
+}
+
+type singleByteRange struct {
+	start int64
+	end   int64
+}
+
+func parseSingleByteRange(header string, total int64) (singleByteRange, bool, bool) {
+	header = strings.TrimSpace(header)
+	if !strings.HasPrefix(header, "bytes=") {
+		return singleByteRange{}, false, false
+	}
+
+	spec := strings.TrimSpace(strings.TrimPrefix(header, "bytes="))
+	if strings.Contains(spec, ",") {
+		return singleByteRange{}, false, false
+	}
+
+	parts := strings.SplitN(spec, "-", 2)
+	if len(parts) != 2 {
+		return singleByteRange{}, true, false
+	}
+
+	startText := strings.TrimSpace(parts[0])
+	endText := strings.TrimSpace(parts[1])
+	if total <= 0 {
+		return singleByteRange{}, true, false
+	}
+
+	if startText == "" {
+		if endText == "" {
+			return singleByteRange{}, true, false
+		}
+
+		suffixLength, err := strconv.ParseInt(endText, 10, 64)
+		if err != nil || suffixLength <= 0 {
+			return singleByteRange{}, true, false
+		}
+		if suffixLength > total {
+			suffixLength = total
+		}
+
+		return singleByteRange{start: total - suffixLength, end: total - 1}, true, true
+	}
+
+	start, err := strconv.ParseInt(startText, 10, 64)
+	if err != nil || start < 0 || start >= total {
+		return singleByteRange{}, true, false
+	}
+
+	if endText == "" {
+		return singleByteRange{start: start, end: total - 1}, true, true
+	}
+
+	end, err := strconv.ParseInt(endText, 10, 64)
+	if err != nil || end < start {
+		return singleByteRange{}, true, false
+	}
+	if end >= total {
+		end = total - 1
+	}
+
+	return singleByteRange{start: start, end: end}, true, true
+}
+
 func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (time.Duration, bool) {
+	if status == http.StatusPartialContent {
+		return 0, false
+	}
+
 	reasons, expireBy, err := cachecontrol.CachableResponseWriter(r, status, w, cachecontrol.Options{})
 	if err != nil || len(reasons) > 0 {
 		return 0, false

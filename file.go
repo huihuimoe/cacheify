@@ -171,7 +171,8 @@ func unmarshalMetadata(data []byte) (cacheMetadata, error) {
 // cachedResponse represents a cached HTTP response with streamable body
 type cachedResponse struct {
 	Metadata cacheMetadata
-	Body     io.ReadCloser
+	Body     *bodyReader
+	BodySize int64
 }
 
 type fileCache struct {
@@ -426,24 +427,48 @@ func (c *fileCache) GetStream(key string) (*cachedResponse, error) {
 		return nil, fmt.Errorf("error unmarshaling metadata: %w", err)
 	}
 
+	bodyOffset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		mu.RUnlock(c.lm)
+		_ = file.Close()
+		return nil, fmt.Errorf("error finding body offset: %w", err)
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		mu.RUnlock(c.lm)
+		_ = file.Close()
+		return nil, fmt.Errorf("error statting cache file: %w", err)
+	}
+
+	bodySize := info.Size() - bodyOffset
+	if bodySize < 0 {
+		mu.RUnlock(c.lm)
+		_ = file.Close()
+		return nil, errCacheMiss
+	}
+
 	// File is now positioned at start of body data - wrap for streaming
 	body := &bodyReader{
-		file: file,
-		lm:   c.lm,
-		path: key,
+		file:       file,
+		bodyOffset: bodyOffset,
+		lm:         c.lm,
+		path:       key,
 	}
 
 	return &cachedResponse{
 		Metadata: metadata,
 		Body:     body,
+		BodySize: bodySize,
 	}, nil
 }
 
 // bodyReader wraps a file and adds cleanup on close
 type bodyReader struct {
-	file *os.File
-	lm   *lockManager
-	path string
+	file       *os.File
+	bodyOffset int64
+	lm         *lockManager
+	path       string
 }
 
 func (br *bodyReader) Read(p []byte) (n int, err error) {

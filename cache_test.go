@@ -135,6 +135,210 @@ func TestCache_WebSocketUpgradeBypass(t *testing.T) {
 	verifyNoTempFiles(t, dir)
 }
 
+func TestCache_RangeResponseNotCached(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "max-age=20")
+
+		if req.Header.Get("Range") != "" {
+			rw.Header().Set("Content-Range", "bytes 0-3/8")
+			rw.WriteHeader(http.StatusPartialContent)
+			_, _ = rw.Write([]byte("part"))
+			return
+		}
+
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("complete"))
+	}
+
+	c := newTestCache(t, dir, next)
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	rangeReq.Header.Set("Range", "bytes=0-3")
+	rangeRW := httptest.NewRecorder()
+	c.ServeHTTP(rangeRW, rangeReq)
+
+	if rangeRW.Code != http.StatusPartialContent {
+		t.Fatalf("range request: expected 206, got %d", rangeRW.Code)
+	}
+
+	fullReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	fullRW := httptest.NewRecorder()
+	c.ServeHTTP(fullRW, fullReq)
+
+	if state := fullRW.Header().Get("Cache-Status"); state != cacheMissStatus {
+		t.Fatalf("full request after range request: expected cache miss, got %q", state)
+	}
+	if fullRW.Code != http.StatusOK {
+		t.Fatalf("full request after range request: expected 200, got %d", fullRW.Code)
+	}
+	if body := fullRW.Body.String(); body != "complete" {
+		t.Fatalf("full request after range request: expected complete body, got %q", body)
+	}
+}
+
+func TestCache_RangeRequestServedFromExistingCache(t *testing.T) {
+	dir := createTempDir(t)
+
+	var rangeUpstreamCalls int
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "max-age=20")
+
+		if req.Header.Get("Range") != "" {
+			rangeUpstreamCalls++
+			rw.Header().Set("Content-Range", "bytes 0-3/8")
+			rw.WriteHeader(http.StatusPartialContent)
+			_, _ = rw.Write([]byte("upstream"))
+			return
+		}
+
+		rw.Header().Set("Content-Length", "13")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("complete body"))
+	}
+
+	c := newTestCache(t, dir, next)
+
+	fullReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	fullRW := httptest.NewRecorder()
+	c.ServeHTTP(fullRW, fullReq)
+
+	if state := fullRW.Header().Get("Cache-Status"); state != cacheMissStatus {
+		t.Fatalf("initial full request: expected cache miss, got %q", state)
+	}
+
+	tests := []struct {
+		name          string
+		rangeHeader   string
+		contentRange  string
+		contentLength string
+		body          string
+	}{
+		{
+			name:          "bounded",
+			rangeHeader:   "bytes=2-5",
+			contentRange:  "bytes 2-5/13",
+			contentLength: "4",
+			body:          "mple",
+		},
+		{
+			name:          "open ended",
+			rangeHeader:   "bytes=9-",
+			contentRange:  "bytes 9-12/13",
+			contentLength: "4",
+			body:          "body",
+		},
+		{
+			name:          "suffix",
+			rangeHeader:   "bytes=-4",
+			contentRange:  "bytes 9-12/13",
+			contentLength: "4",
+			body:          "body",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rangeReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+			rangeReq.Header.Set("Range", test.rangeHeader)
+			rangeRW := httptest.NewRecorder()
+			c.ServeHTTP(rangeRW, rangeReq)
+
+			if rangeUpstreamCalls != 0 {
+				t.Fatalf("range request: expected cached response, upstream was called %d times", rangeUpstreamCalls)
+			}
+			if state := rangeRW.Header().Get("Cache-Status"); state != cacheHitStatus {
+				t.Fatalf("range request: expected cache hit, got %q", state)
+			}
+			if rangeRW.Code != http.StatusPartialContent {
+				t.Fatalf("range request: expected 206, got %d", rangeRW.Code)
+			}
+			if contentRange := rangeRW.Header().Get("Content-Range"); contentRange != test.contentRange {
+				t.Fatalf("range request: expected Content-Range %s, got %q", test.contentRange, contentRange)
+			}
+			if contentLength := rangeRW.Header().Get("Content-Length"); contentLength != test.contentLength {
+				t.Fatalf("range request: expected Content-Length %s, got %q", test.contentLength, contentLength)
+			}
+			if body := rangeRW.Body.String(); body != test.body {
+				t.Fatalf("range request: expected cached partial body %q, got %q", test.body, body)
+			}
+		})
+	}
+}
+
+func TestCache_RangeRequestRejectsUnsatisfiableCachedRange(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("complete body"))
+	}
+
+	c := newTestCache(t, dir, next)
+
+	fullReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	c.ServeHTTP(httptest.NewRecorder(), fullReq)
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	rangeReq.Header.Set("Range", "bytes=99-100")
+	rangeRW := httptest.NewRecorder()
+	c.ServeHTTP(rangeRW, rangeReq)
+
+	if rangeRW.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("range request: expected 416, got %d", rangeRW.Code)
+	}
+	if contentRange := rangeRW.Header().Get("Content-Range"); contentRange != "bytes */13" {
+		t.Fatalf("range request: expected Content-Range bytes */13, got %q", contentRange)
+	}
+	if contentLength := rangeRW.Header().Get("Content-Length"); contentLength != "0" {
+		t.Fatalf("range request: expected Content-Length 0, got %q", contentLength)
+	}
+}
+
+func TestCache_MultipleRangeRequestBypassesExistingCache(t *testing.T) {
+	dir := createTempDir(t)
+
+	var rangeUpstreamCalls int
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "max-age=20")
+
+		if req.Header.Get("Range") != "" {
+			rangeUpstreamCalls++
+			rw.Header().Set("Content-Range", "bytes 0-1/13")
+			rw.WriteHeader(http.StatusPartialContent)
+			_, _ = rw.Write([]byte("up"))
+			return
+		}
+
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("complete body"))
+	}
+
+	c := newTestCache(t, dir, next)
+
+	fullReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	c.ServeHTTP(httptest.NewRecorder(), fullReq)
+
+	rangeReq := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	rangeReq.Header.Set("Range", "bytes=0-1,3-4")
+	rangeRW := httptest.NewRecorder()
+	c.ServeHTTP(rangeRW, rangeReq)
+
+	if rangeUpstreamCalls != 1 {
+		t.Fatalf("multiple range request: expected upstream bypass, upstream was called %d times", rangeUpstreamCalls)
+	}
+	if state := rangeRW.Header().Get("Cache-Status"); state != "" {
+		t.Fatalf("multiple range request: expected cache bypass, got cache status %q", state)
+	}
+	if body := rangeRW.Body.String(); body != "up" {
+		t.Fatalf("multiple range request: expected upstream body, got %q", body)
+	}
+}
+
 func TestCache_UpstreamFailureDuringStream(t *testing.T) {
 	dir := createTempDir(t)
 
@@ -361,6 +565,27 @@ func createTempDir(tb testing.TB) string {
 	})
 
 	return dir
+}
+
+func newTestCache(tb testing.TB, dir string, next http.HandlerFunc) http.Handler {
+	tb.Helper()
+
+	cfg := &Config{
+		Path:              dir,
+		MaxExpiry:         10,
+		Cleanup:           20,
+		AddStatusHeader:   true,
+		MaxHeaderPairs:    4,
+		MaxHeaderKeyLen:   30,
+		MaxHeaderValueLen: 100,
+	}
+
+	c, err := New(context.Background(), next, cfg, "cacheify")
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	return c
 }
 
 func TestCache_DoubleCheckedLocking(t *testing.T) {
