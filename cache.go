@@ -332,6 +332,9 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 	if !isIdentityEncoded(w.Header().Get("Content-Encoding")) {
 		return 0, false
 	}
+	if !isSupportedVary(w.Header().Values("Vary")) {
+		return 0, false
+	}
 
 	reasons, expireBy, err := cachecontrol.CachableResponseWriter(r, status, w, cachecontrol.Options{})
 	if err != nil || len(reasons) > 0 {
@@ -356,6 +359,48 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 func isIdentityEncoded(contentEncoding string) bool {
 	contentEncoding = strings.TrimSpace(contentEncoding)
 	return contentEncoding == "" || strings.EqualFold(contentEncoding, "identity")
+}
+
+func isSupportedVary(values []string) bool {
+	for _, value := range values {
+		for _, field := range strings.Split(value, ",") {
+			field = strings.TrimSpace(field)
+			if field == "" {
+				continue
+			}
+			if !strings.EqualFold(field, "Accept-Encoding") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sanitizeResponseHeaders(headers http.Header) {
+	for _, value := range headers.Values("Connection") {
+		for _, field := range strings.Split(value, ",") {
+			if field = strings.TrimSpace(field); field != "" {
+				headers.Del(field)
+			}
+		}
+	}
+
+	for _, header := range []string{
+		"Alt-Svc",
+		"Vary",
+		"Age",
+		"Date",
+		"Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+	} {
+		headers.Del(header)
+	}
 }
 
 func cacheKey(r *http.Request, includeQuery bool) string {
@@ -434,6 +479,7 @@ func (rw *responseWriter) WriteHeader(s int) {
 
 	// Make cache decision now that we have status and headers
 	expiry, cacheable := rw.checkCacheable(rw.request, rw.ResponseWriter, s)
+	sanitizeResponseHeaders(rw.ResponseWriter.Header())
 
 	if cacheable {
 		// Strip Set-Cookie headers if configured (affects both cache and response)

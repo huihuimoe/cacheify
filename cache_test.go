@@ -396,6 +396,76 @@ func TestCache_EncodedUpstreamResponseNotCached(t *testing.T) {
 	}
 }
 
+func TestCache_StripsUpstreamResponseHeaders(t *testing.T) {
+	dir := createTempDir(t)
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.Header().Set("Alt-Svc", `h3=":443"; ma=2592000`)
+		rw.Header().Set("Vary", "Accept-Encoding")
+		rw.Header().Set("Age", "123")
+		rw.Header().Set("Date", "Wed, 01 Jul 2026 08:17:03 GMT")
+		rw.Header().Set("Connection", "close")
+		rw.Header().Set("Keep-Alive", "timeout=5")
+		rw.Header().Set("Transfer-Encoding", "chunked")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("clean body"))
+	}
+
+	c := newTestCache(t, dir, next)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+
+	for _, expectedState := range []string{cacheMissStatus, cacheHitStatus} {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+
+		if state := rw.Header().Get("Cache-Status"); state != expectedState {
+			t.Fatalf("expected cache %s, got %q", expectedState, state)
+		}
+		for _, header := range []string{"Alt-Svc", "Vary", "Age", "Date", "Connection", "Keep-Alive", "Transfer-Encoding"} {
+			if value := rw.Header().Get(header); value != "" {
+				t.Fatalf("expected %s to be stripped, got %q", header, value)
+			}
+		}
+		if cacheControl := rw.Header().Get("Cache-Control"); cacheControl != "max-age=20" {
+			t.Fatalf("expected Cache-Control to be preserved, got %q", cacheControl)
+		}
+	}
+}
+
+func TestCache_ResponseWithUnsupportedVaryNotCached(t *testing.T) {
+	dir := createTempDir(t)
+
+	var upstreamCalls int
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		upstreamCalls++
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.Header().Set("Vary", "Accept-Language")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("language variant"))
+	}
+
+	c := newTestCache(t, dir, next)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+
+		if state := rw.Header().Get("Cache-Status"); state != cacheMissStatus {
+			t.Fatalf("request %d: expected cache miss, got %q", i+1, state)
+		}
+		if vary := rw.Header().Get("Vary"); vary != "" {
+			t.Fatalf("request %d: expected Vary to be stripped, got %q", i+1, vary)
+		}
+	}
+
+	if upstreamCalls != 2 {
+		t.Fatalf("expected unsupported Vary to bypass cache, upstream was called %d times", upstreamCalls)
+	}
+}
+
 func TestCache_UpstreamFailureDuringStream(t *testing.T) {
 	dir := createTempDir(t)
 
