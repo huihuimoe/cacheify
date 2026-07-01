@@ -339,6 +339,63 @@ func TestCache_MultipleRangeRequestBypassesExistingCache(t *testing.T) {
 	}
 }
 
+func TestCache_RequestsIdentityEncodingFromUpstream(t *testing.T) {
+	dir := createTempDir(t)
+
+	var upstreamAcceptEncoding string
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		upstreamAcceptEncoding = req.Header.Get("Accept-Encoding")
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("identity body"))
+	}
+
+	c := newTestCache(t, dir, next)
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	rw := httptest.NewRecorder()
+	c.ServeHTTP(rw, req)
+
+	if upstreamAcceptEncoding != "identity" {
+		t.Fatalf("expected upstream Accept-Encoding identity, got %q", upstreamAcceptEncoding)
+	}
+}
+
+func TestCache_EncodedUpstreamResponseNotCached(t *testing.T) {
+	dir := createTempDir(t)
+
+	var upstreamCalls int
+
+	next := func(rw http.ResponseWriter, req *http.Request) {
+		upstreamCalls++
+		rw.Header().Set("Cache-Control", "max-age=20")
+		rw.Header().Set("Content-Encoding", "gzip")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("compressed body"))
+	}
+
+	c := newTestCache(t, dir, next)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/asset.svg", nil)
+
+	for i := 0; i < 2; i++ {
+		rw := httptest.NewRecorder()
+		c.ServeHTTP(rw, req)
+
+		if state := rw.Header().Get("Cache-Status"); state != cacheMissStatus {
+			t.Fatalf("request %d: expected cache miss, got %q", i+1, state)
+		}
+		if encoding := rw.Header().Get("Content-Encoding"); encoding != "gzip" {
+			t.Fatalf("request %d: expected gzip response passthrough, got %q", i+1, encoding)
+		}
+	}
+
+	if upstreamCalls != 2 {
+		t.Fatalf("expected encoded response to bypass cache, upstream was called %d times", upstreamCalls)
+	}
+}
+
 func TestCache_UpstreamFailureDuringStream(t *testing.T) {
 	dir := createTempDir(t)
 

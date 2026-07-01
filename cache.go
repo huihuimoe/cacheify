@@ -175,11 +175,14 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(cacheHeader, cs)
 	}
 
+	upstreamReq := r.Clone(r.Context())
+	upstreamReq.Header.Set("Accept-Encoding", "identity")
+
 	rw := &responseWriter{
 		ResponseWriter: w,
 		cache:          m.cache,
 		cacheKey:       key,
-		request:        r,
+		request:        upstreamReq,
 		config:         m.cfg,
 		checkCacheable: m.cacheable,
 	}
@@ -200,7 +203,7 @@ func (m *cache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	m.next.ServeHTTP(rw, r)
+	m.next.ServeHTTP(rw, upstreamReq)
 }
 
 func (m *cache) serveCachedResponse(w http.ResponseWriter, cached *cachedResponse) {
@@ -326,6 +329,9 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 	if status == http.StatusPartialContent {
 		return 0, false
 	}
+	if !isIdentityEncoded(w.Header().Get("Content-Encoding")) {
+		return 0, false
+	}
 
 	reasons, expireBy, err := cachecontrol.CachableResponseWriter(r, status, w, cachecontrol.Options{})
 	if err != nil || len(reasons) > 0 {
@@ -345,6 +351,11 @@ func (m *cache) cacheable(r *http.Request, w http.ResponseWriter, status int) (t
 	}
 
 	return expiry, true
+}
+
+func isIdentityEncoded(contentEncoding string) bool {
+	contentEncoding = strings.TrimSpace(contentEncoding)
+	return contentEncoding == "" || strings.EqualFold(contentEncoding, "identity")
 }
 
 func cacheKey(r *http.Request, includeQuery bool) string {
